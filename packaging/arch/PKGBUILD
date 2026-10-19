@@ -10,7 +10,7 @@ depends=('coreutils' 'findutils' 'gawk' 'util-linux')
 optdepends=('pacman-contrib: keep two Arch package-cache versions with paccache'
             'fish: install Fish completions')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('53debaa8ac504f5b96e6490eeb8d8fd42c437a3a687975ed2ff5974f4f5c9ccd')
 
 package() {
     cd "${srcdir}/${pkgname}-${pkgver}"
