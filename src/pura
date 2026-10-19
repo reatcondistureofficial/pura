@@ -1,0 +1,537 @@
+#!/bin/sh
+# pura - Safe Linux disk space recovery CLI.
+# POSIX sh: works when launched from Bash, Fish, Dash, Zsh, or another shell.
+
+set -u
+
+VERSION="0.1.0"
+DRY_RUN=0
+YES=0
+AGGRESSIVE=0
+COMMAND=""
+ARG1=""
+ARG2=""
+BEFORE_KB=""
+
+PROGRAM="pura"
+
+say() {
+    printf '%s\n' "$*"
+}
+
+info() {
+    printf '%s\n' "[pura] $*"
+}
+
+warn() {
+    printf '%s\n' "[pura][uyarı] $*" >&2
+}
+
+die() {
+    printf '%s\n' "[pura][hata] $*" >&2
+    exit 1
+}
+
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+usage() {
+    cat <<'EOF'
+pura - Linux'ta güvenli disk alanı kurtarma aracı
+
+KULLANIM
+  pura [seçenekler] scan [PATH]
+  pura [seçenekler] scan disk /dev/sdX
+  pura [seçenekler] clean {all|caches|packages|logs|temp|trash}
+  pura [seçenekler] clean /dev/sdX
+  pura [seçenekler] clean disk /dev/sdX
+  pura [seçenekler] doctor
+  pura [seçenekler] explain
+
+SEÇENEKLER
+  -n, --dry-run     Hiçbir değişiklik yapmadan planı göster
+  -y, --yes         Güvenli temizlik onayını atla (disk onayını atlayamaz)
+      --aggressive  Daha geniş kullanıcı cache temizliği ve kullanılmayan
+                    Flatpak runtime temizliği; yine de ham diske yazmaz
+  -h, --help        Bu yardımı göster
+      --version     Sürümü göster
+
+GÜVENLİK MODELİ
+  scan varsayılan olarak salt okunurdur. clean yalnızca bilinen cache, çöp,
+  sistem paket cache'i, systemd journal ve temp bakım yollarında çalışır.
+  clean /dev/sdX komutu bölüm tablosunu, filesystem'i veya ham aygıtı asla silmez.
+  Disk temizliği için aygıtın bağlı bir filesystem içermesi ve etkileşimli
+  olarak CLEAN /dev/sdX yazılması gerekir.
+
+ÖRNEKLER
+  pura scan
+  pura scan /home
+  pura clean all --dry-run
+  sudo pura clean packages
+  pura clean caches --aggressive
+  pura clean disk /dev/sda
+EOF
+}
+
+version() {
+    say "$PROGRAM $VERSION"
+}
+
+human_kb() {
+    awk -v kb="${1:-0}" 'BEGIN {
+        if (kb < 1024) printf "%.0f KiB", kb;
+        else if (kb < 1024 * 1024) printf "%.1f MiB", kb / 1024;
+        else if (kb < 1024 * 1024 * 1024) printf "%.2f GiB", kb / (1024 * 1024);
+        else printf "%.2f TiB", kb / (1024 * 1024 * 1024);
+    }'
+}
+
+df_available_kb() {
+    # POSIX df output has a header followed by one row. -P keeps it one-line.
+    df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 + 0; exit }'
+}
+
+start_measure() {
+    BEFORE_KB=$(df_available_kb "$1")
+    [ -n "$BEFORE_KB" ] || BEFORE_KB=0
+}
+
+end_measure() {
+    after=$(df_available_kb "$1")
+    [ -n "$after" ] || after=0
+    freed=$((after - BEFORE_KB))
+    if [ "$freed" -lt 0 ]; then
+        freed=0
+    fi
+    info "Kullanılabilir alan değişimi: $(human_kb "$freed")"
+}
+
+run_cmd() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'
+        for arg in "$@"; do
+            printf ' %s' "$(printf '%s' "$arg" | sed 's/[^A-Za-z0-9_./:=+,-]/\\&/g')"
+        done
+        printf '\n'
+        return 0
+    fi
+    "$@"
+}
+
+run_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        run_cmd "$@"
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] sudo'
+        for arg in "$@"; do
+            printf ' %s' "$(printf '%s' "$arg" | sed 's/[^A-Za-z0-9_./:=+,-]/\\&/g')"
+        done
+        printf '\n'
+    elif has_cmd sudo; then
+        sudo "$@"
+    else
+        warn "Bu işlem root veya sudo gerektiriyor; sudo bulunamadı: $*"
+        return 1
+    fi
+}
+
+confirm() {
+    prompt=$1
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ "$YES" -eq 1 ] && return 0
+    printf '[pura] %s [y/N] ' "$prompt"
+    read -r answer || return 1
+    case "$answer" in
+        y|Y|yes|YES|evet|EVET) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+confirm_disk() {
+    device=$1
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    printf '[pura] Bu işlem yalnızca bilinen cache/log/temp yollarını temizler.\n'
+    printf '[pura] Ham diski silmez, formatlamaz ve bölüm tablosuna dokunmaz.\n'
+    printf '[pura] Devam etmek için tam olarak CLEAN %s yazın: ' "$device"
+    read -r answer || return 1
+    [ "$answer" = "CLEAN $device" ]
+}
+
+safe_user_dir() {
+    target=$1
+    [ -n "${HOME:-}" ] || { warn 'HOME tanımlı değil; kullanıcı dizini temizliği atlandı.'; return 1; }
+    home_real=$(realpath -e -- "$HOME" 2>/dev/null) || return 1
+    target_real=$(realpath -e -- "$target" 2>/dev/null) || return 1
+    case "$target_real" in
+        "$home_real"/*) return 0 ;;
+        *) warn "Güvenlik nedeniyle kullanıcı home dizini dışı yol atlandı: $target"; return 1 ;;
+    esac
+}
+
+clear_dir_contents() {
+    dir=$1
+    label=$2
+    [ -d "$dir" ] || return 0
+    safe_user_dir "$dir" || {
+        warn "İzin verilen kullanıcı dizini dışında veya çözümlenemeyen yol; atlandı: $dir"
+        return 0
+    }
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "Temizlenecek: $dir ($label)"
+        return 0
+    fi
+    info "Temizleniyor: $dir ($label)"
+    # -xdev prevents crossing into nested mounts; depth-first -delete removes
+    # entries on this filesystem only. A mountpoint itself cannot be rmdir'd
+    # while mounted, unlike passing it recursively to rm -rf.
+    find "$dir" -xdev -depth -mindepth 1 -delete 2>/dev/null || {
+        warn "Bazı dosyalar temizlenemedi: $dir"
+        return 1
+    }
+}
+
+cache_root() {
+    [ -n "${HOME:-}" ] || { warn 'HOME tanımlı değil; cache temizliği atlandı.'; return 1; }
+    home_real=$(realpath -e -- "$HOME" 2>/dev/null) || { warn 'HOME çözümlenemedi.'; return 1; }
+    root=${XDG_CACHE_HOME:-"$home_real/.cache"}
+    root_real=$(realpath -m -- "$root" 2>/dev/null) || return 1
+    case "$root_real" in
+        "$home_real"/*) printf '%s\n' "$root_real" ;;
+        *) warn 'XDG_CACHE_HOME home dizininin dışına çıkıyor; cache temizliği atlandı.'; return 1 ;;
+    esac
+}
+
+clean_caches() {
+    root=$(cache_root) || return 0
+    if ! confirm "Bilinen kullanıcı cache klasörlerinin içeriği temizlensin mi?"; then
+        info "İptal edildi."
+        return 0
+    fi
+    # These are rebuildable caches, not configuration or user documents.
+    for rel in \
+        thumbnails pip npm yarn pnpm paru yay uv fontconfig mesa_shader_cache \
+        google-chrome chromium BraveSoftware/Brave-Browser microsoft-edge mozilla; do
+        clear_dir_contents "$root/$rel" "yeniden oluşturulabilir kullanıcı cache'i" || true
+    done
+    if [ "$AGGRESSIVE" -eq 1 ]; then
+        warn "--aggressive etkin: $root altındaki diğer cache klasörleri de temizlenecek."
+        clear_dir_contents "$root" "agresif kullanıcı cache temizliği" || true
+    fi
+}
+
+clean_trash() {
+    [ -n "${HOME:-}" ] || { warn 'HOME tanımlı değil; çöp kutusu atlandı.'; return 0; }
+    trash="$HOME/.local/share/Trash"
+    if ! confirm "Kullanıcının çöp kutusu kalıcı olarak boşaltılsın mı?"; then
+        info "İptal edildi."
+        return 0
+    fi
+    clear_dir_contents "$trash/files" "çöp kutusu dosyaları" || true
+    clear_dir_contents "$trash/info" "çöp kutusu metadata" || true
+}
+
+clean_packages() {
+    if ! confirm "Dağıtım paket cache'i temizlensin mi? Kurulu paketler silinmez."; then
+        info "İptal edildi."
+        return 0
+    fi
+    if has_cmd pacman; then
+        if has_cmd paccache; then
+            run_root paccache -r -k 2 || true
+        else
+            # -Sc removes only packages no longer installed; it does not remove
+            # the installed system or touch a block device.
+            run_root pacman -Sc --noconfirm || true
+        fi
+    elif has_cmd apt-get; then
+        run_root apt-get clean || true
+    elif has_cmd dnf; then
+        run_root dnf clean all || true
+    elif has_cmd zypper; then
+        run_root zypper clean --all || true
+    elif has_cmd apk; then
+        run_root apk cache clean || true
+    elif has_cmd xbps-remove; then
+        run_root xbps-remove -O || true
+    else
+        warn "Desteklenen paket yöneticisi bulunamadı (pacman/apt/dnf/zypper/apk/xbps)."
+    fi
+    if [ "$AGGRESSIVE" -eq 1 ] && has_cmd flatpak; then
+        run_cmd flatpak uninstall --unused -y || true
+    fi
+}
+
+clean_logs() {
+    if ! confirm "systemd journal kayıtları 14 günden eski olanlar temizlensin mi?"; then
+        info "İptal edildi."
+        return 0
+    fi
+    if has_cmd journalctl; then
+        run_root journalctl --vacuum-time=14d || true
+    else
+        warn "journalctl bulunamadı; log temizliği atlandı."
+    fi
+}
+
+clean_temp() {
+    if ! confirm "systemd tarafından yönetilen geçici dosya bakımı çalıştırılsın mı?"; then
+        info "İptal edildi."
+        return 0
+    fi
+    if has_cmd systemd-tmpfiles; then
+        run_root systemd-tmpfiles --clean || true
+    else
+        warn "systemd-tmpfiles bulunamadı; rastgele /tmp silme yapılmadı."
+    fi
+}
+
+clean_all() {
+    if ! confirm "Güvenli temizlik planı (cache + paket cache + journal + temp + çöp) çalıştırılsın mı?"; then
+        info "İptal edildi."
+        return 0
+    fi
+    # Subcommands ask again only when invoked directly; all uses the one plan
+    # confirmation above, so temporarily bypass those confirmations.
+    old_yes=$YES
+    YES=1
+    clean_caches
+    clean_packages
+    clean_logs
+    clean_temp
+    clean_trash
+    YES=$old_yes
+}
+
+mounted_for_device() {
+    device=$1
+    [ -b "$device" ] || return 0
+    if has_cmd findmnt; then
+        # Include a filesystem mounted directly on the supplied device.
+        findmnt -nr -S "$device" -o TARGET 2>/dev/null || true
+    fi
+    if has_cmd lsblk; then
+        lsblk -nrpo NAME,TYPE "$device" 2>/dev/null | while IFS=' ' read -r name type; do
+            [ -n "${name:-}" ] || continue
+            [ "$type" = "disk" ] && [ "$name" != "$device" ] && continue
+            if has_cmd findmnt; then
+                findmnt -nr -S "$name" -o TARGET 2>/dev/null || true
+            fi
+        done
+    fi
+}
+
+device_mounts() {
+    mounted_for_device "$1" | awk 'NF && !seen[$0]++'
+}
+
+scan_path() {
+    path=${1:-/}
+    [ -d "$path" ] || die "Dizin bulunamadı: $path"
+    info "Filesystem görünümü: $path"
+    df -hP "$path" 2>/dev/null || true
+    printf '\n'
+    info "Birinci seviye kullanım (salt okunur):"
+    if du -xhd1 -- "$path" >/dev/null 2>&1; then
+        du -xhd1 -- "$path" 2>/dev/null | sort -h
+    else
+        du -xk -d 1 -- "$path" 2>/dev/null | sort -n | awk '{ printf "%s KiB %s\n", $1, substr($0, index($0,$2)) }'
+    fi
+}
+
+scan_disk() {
+    device=$1
+    [ -b "$device" ] || die "Blok aygıtı bulunamadı veya blok aygıtı değil: $device"
+    info "Aygıt bilgisi: $device"
+    if has_cmd lsblk; then
+        lsblk -f "$device" || true
+    fi
+    mounts=$(device_mounts "$device")
+    if [ -z "$mounts" ]; then
+        warn "Bu aygıtta bağlı filesystem bulunamadı; temizleme yapılmayacak."
+        return 0
+    fi
+    printf '\n'
+    info "Bağlı mount noktaları:"
+    printf '%s\n' "$mounts"
+    while IFS= read -r mount; do
+        [ -n "$mount" ] || continue
+        scan_path "$mount"
+    done <<EOF_MOUNTS
+$mounts
+EOF_MOUNTS
+}
+
+clean_mount_for_disk() {
+    mount=$1
+    cache=$(cache_root 2>/dev/null) || cache=""
+    trash="$HOME/.local/share/Trash"
+    mount_dev=$(stat -c '%d' "$mount" 2>/dev/null || true)
+    [ -n "$mount_dev" ] || return 0
+    if [ -n "$cache" ] && [ -d "$cache" ] && [ "$(stat -c '%d' "$cache" 2>/dev/null || true)" = "$mount_dev" ]; then
+        clean_caches
+    else
+        info "Kullanıcı cache'i bu filesystem üzerinde değil; atlandı: $mount"
+    fi
+    if [ -d "$trash/files" ] && [ "$(stat -c '%d' "$trash/files" 2>/dev/null || true)" = "$mount_dev" ]; then
+        clean_trash
+    fi
+}
+
+clean_disk() {
+    device=$1
+    case "$device" in /dev/*) ;; *) die 'Aygıt yolu /dev altında olmalı.' ;; esac
+    has_cmd realpath || die 'Güvenli aygıt doğrulaması için realpath gerekli.'
+    canonical=$(realpath -e -- "$device" 2>/dev/null) || die "Aygıt yolu çözümlenemedi: $device"
+    case "$canonical" in /dev/*) ;; *) die 'Aygıt yolu /dev dışında çözümlendi; reddedildi.' ;; esac
+    [ -b "$canonical" ] || die "Blok aygıtı değil: $device"
+    device=$canonical
+    mounts=$(device_mounts "$device")
+    if [ -z "$mounts" ]; then
+        die "$device üzerinde bağlı filesystem yok. Ham aygıt temizliği kasıtlı olarak desteklenmiyor."
+    fi
+    info "$device üzerindeki bağlı mount noktaları:"
+    printf '%s\n' "$mounts"
+    confirm_disk "$device" || {
+        info "İptal edildi."
+        return 0
+    }
+    mounts_after=$(device_mounts "$device")
+    [ "$mounts" = "$mounts_after" ] || die 'Onay sırasında aygıtın mount durumu değişti; güvenlik için durduruldu.'
+    if printf '%s\n' "$mounts" | grep -Fx '/' >/dev/null 2>&1; then
+        measure_path="/"
+    else
+        measure_path=$(printf '%s\n' "$mounts" | sed -n '1p')
+    fi
+    start_measure "$measure_path"
+    while IFS= read -r mount; do
+        [ -n "$mount" ] || continue
+        clean_mount_for_disk "$mount"
+    done <<EOF_MOUNTS
+$mounts
+EOF_MOUNTS
+    end_measure "$measure_path"
+}
+
+doctor() {
+    info "Sürüm: $VERSION"
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        info "Dağıtım: ${PRETTY_NAME:-${NAME:-bilinmiyor}}"
+    fi
+    info "Shell bağımsızlığı: POSIX sh; çağıran shell: ${SHELL:-bilinmiyor}"
+    info "Root: $(id -u)"
+    for cmd in df du find lsblk findmnt journalctl systemd-tmpfiles sudo pacman apt-get dnf zypper apk xbps-remove flatpak; do
+        if has_cmd "$cmd"; then
+            printf '  [+] %s\n' "$cmd"
+        else
+            printf '  [-] %s\n' "$cmd"
+        fi
+    done
+}
+
+explain() {
+    cat <<'EOF'
+Pura'nın bilinçli sınırları:
+
+  * /dev/sdX yalnızca mount noktası keşfi için okunur.
+  * dd, wipefs, mkfs, fdisk, sfdisk, parted ve bölüm tablosu işlemleri yoktur.
+  * clean disk, bağlı olmayan veya filesystem'i tanınmayan aygıtı reddeder.
+  * Varsayılan cache temizliği yalnızca yeniden oluşturulabilir cache yollarını
+    hedefler; config, belge ve kişisel dosyalar hedeflenmez.
+  * --aggressive bile yalnızca mevcut kullanıcının ~/.cache içeriğini ve
+    kullanılmayan Flatpak runtime'larını genişletir; ham diske dokunmaz.
+  * paket yöneticisi temizliği kurulu paketleri kaldırmaz; autoremove ve
+    docker system prune gibi sürprizli işlemler özellikle yoktur.
+
+Temizlikten önce öneri: `pura scan`, çalışan tarayıcıları kapatmak ve
+`pura clean all --dry-run` çıktısını incelemek.
+EOF
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1
+                ;;
+            -y|--yes)
+                YES=1
+                ;;
+            --aggressive)
+                AGGRESSIVE=1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --version)
+                version
+                exit 0
+                ;;
+            --)
+                shift
+                while [ "$#" -gt 0 ]; do
+                    if [ -z "$COMMAND" ]; then COMMAND=$1
+                    elif [ -z "$ARG1" ]; then ARG1=$1
+                    elif [ -z "$ARG2" ]; then ARG2=$1
+                    else die "Çok fazla argüman."; fi
+                    shift
+                done
+                return 0
+                ;;
+            *)
+                if [ -z "$COMMAND" ]; then COMMAND=$1
+                elif [ -z "$ARG1" ]; then ARG1=$1
+                elif [ -z "$ARG2" ]; then ARG2=$1
+                else die "Çok fazla argüman."; fi
+                ;;
+        esac
+        shift
+    done
+}
+
+main() {
+    parse_args "$@"
+    [ -n "$COMMAND" ] || { usage; exit 0; }
+    case "$COMMAND" in
+        scan)
+            if [ "$ARG1" = "disk" ]; then
+                [ -n "$ARG2" ] || die 'Kullanım: pura scan disk /dev/sdX'
+                scan_disk "$ARG2"
+            elif [ -n "$ARG1" ]; then
+                if [ -b "$ARG1" ]; then scan_disk "$ARG1"; else scan_path "$ARG1"; fi
+            else
+                scan_path "/"
+            fi
+            ;;
+        clean)
+            [ -n "$ARG1" ] || { usage; exit 2; }
+            case "$ARG1" in
+                all) clean_all ;;
+                caches|cache) clean_caches ;;
+                packages|package) clean_packages ;;
+                logs|log) clean_logs ;;
+                temp|tmp) clean_temp ;;
+                trash) clean_trash ;;
+                disk)
+                    [ -n "$ARG2" ] || die 'Kullanım: pura clean disk /dev/sdX'
+                    clean_disk "$ARG2"
+                    ;;
+                /dev/*)
+                    [ -z "$ARG2" ] || die 'Kullanım: pura clean /dev/sdX'
+                    clean_disk "$ARG1"
+                    ;;
+                *) die "Bilinmeyen temizlik hedefi: $ARG1" ;;
+            esac
+            ;;
+        doctor) doctor ;;
+        explain) explain ;;
+        version) version ;;
+        help) usage ;;
+        *) die "Bilinmeyen komut: $COMMAND" ;;
+    esac
+}
+
+main "$@"

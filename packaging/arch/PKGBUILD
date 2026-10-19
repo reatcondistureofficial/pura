@@ -1,0 +1,22 @@
+# Maintainer: pura contributors
+pkgname=pura
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Safe Linux disk space recovery CLI (Bash/Fish independent)'
+arch=('any')
+url='https://github.com/reatcondistureofficial/pura'
+license=('MIT')
+depends=('coreutils' 'findutils' 'gawk' 'util-linux')
+optdepends=('pacman-contrib: keep two Arch package-cache versions with paccache'
+            'fish: Fish completion support')
+source=()
+sha256sums=()
+
+package() {
+    install -Dm755 "${startdir}/../../src/pura" "${pkgdir}/usr/bin/pura"
+    install -Dm644 "${startdir}/../../docs/pura.1" "${pkgdir}/usr/share/man/man1/pura.1"
+    install -Dm644 "${startdir}/../../completions/pura.bash" \
+        "${pkgdir}/usr/share/bash-completion/completions/pura"
+    install -Dm644 "${startdir}/../../completions/pura.fish" \
+        "${pkgdir}/usr/share/fish/vendor_completions.d/pura.fish"
+}

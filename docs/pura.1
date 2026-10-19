@@ -1,0 +1,93 @@
+.TH PURA 1 "October 2026" "pura 0.1.0" "User Commands"
+.SH NAME
+pura \- safe Linux disk space recovery utility
+.SH SYNOPSIS
+.B pura
+.RB [ \,\-n|\-\-dry-run\, ]
+.RB [ \,\-y|\-\-yes\, ]
+.RB [ \,\-\-aggressive\, ]
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B pura
+cleans rebuildable user caches, distribution package caches, old systemd journal entries, managed temporary files, and the current user's trash. It is a POSIX sh executable and is independent of the calling shell.
+.PP
+The default mode is deliberately conservative. It never formats a device, removes a partition table, writes to a raw block device, runs dd/wipefs/mkfs, removes documents, or runs autoremove or Docker prune.
+.SH COMMANDS
+.TP
+.B scan [PATH]
+Read-only filesystem and first-level directory usage report. Defaults to /.
+.TP
+.B scan disk /dev/sdX
+Show block-device filesystem and mounted paths, without changing anything.
+.TP
+.B clean all
+Run the safe cache, package-cache, journal, temp, and trash plan.
+.TP
+.B clean caches
+Clean known rebuildable caches below the current user's cache directory.
+.TP
+.B clean packages
+Clean the detected package-manager cache without removing installed packages.
+.TP
+.B clean logs
+Vacuum systemd journal entries older than 14 days.
+.TP
+.B clean temp
+Run systemd-tmpfiles --clean when available.
+.TP
+.B clean trash
+Empty the current user's trash permanently.
+.TP
+.B clean /dev/sdX
+Find mounted filesystems on the device and clean only current-user cache/trash paths located on those filesystems. Requires typing CLEAN /dev/sdX. No raw device writes occur.
+.TP
+.B clean disk /dev/sdX
+Equivalent explicit form of clean /dev/sdX.
+.TP
+.B doctor
+Show detected distribution and optional tools.
+.TP
+.B explain
+Print the safety boundaries.
+.SH OPTIONS
+.TP
+.BR -n , --dry-run
+Print the plan without making changes.
+.TP
+.BR -y , --yes
+Skip normal safe-clean confirmation. It does not bypass the typed confirmation for device cleanup.
+.TP
+.B --aggressive
+Clear additional contents of the current user's cache root and remove unused Flatpak runtimes.
+.TP
+.BR -h , --help
+Show help.
+.TP
+.B --version
+Show version.
+.SH EXAMPLES
+.nf
+pura scan
+pura clean all --dry-run
+sudo pura clean packages
+pura clean /dev/sda
+.fi
+.SH FILES
+.TP
+.I ~/.cache
+User cache root, constrained by XDG_CACHE_HOME when set.
+.TP
+.I ~/.local/share/Trash
+Current user's trash.
+.SH EXIT STATUS
+.TP
+0
+The requested operation completed or was safely skipped.
+.TP
+1
+Invalid input, unsafe or unavailable target, or command failure.
+.SH AUTHOR
+pura contributors
+.SH LICENSE
+MIT

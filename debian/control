@@ -1,0 +1,17 @@
+Source: pura
+Section: utils
+Priority: optional
+Maintainer: pura contributors <maintainers@example.invalid>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/reatcondistureofficial/pura
+Rules-Requires-Root: no
+
+Package: pura
+Architecture: all
+Depends: ${shlibs:Depends}, ${misc:Depends}, coreutils, findutils, gawk, util-linux
+Suggests: pacman-contrib, fish
+Description: safe Linux disk space recovery CLI
+ pura cleans rebuildable caches, package-manager caches, old systemd journal
+ entries, managed temporary files, and the current user's trash. It refuses
+ raw block-device destruction and works independently of the calling shell.

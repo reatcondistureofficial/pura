@@ -1,0 +1,6 @@
+dist/
+*.deb
+*.pkg.tar.zst
+*.rpm
+*.swp
+.DS_Store
